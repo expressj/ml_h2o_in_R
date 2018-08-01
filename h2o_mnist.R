@@ -22,8 +22,3 @@ h2o.saveModel(model, "./mnist_dnn")
 
 # Model 불러오기
 load_model <- h2o.loadModel("./mnist_dnn/mnist_dnn")
-
-
-
-
-
