@@ -1,5 +1,5 @@
 ---
-title: "H2O Modeling - Credit Card Fraud Detection"
+title: "Credit Card Fraud Detection"
 author: "ByungSun Bae"
 date: "`r Sys.Date()`"
 output:
@@ -9,19 +9,27 @@ output:
     toc: true
 ---
 
-## R과 H2O를 활용한 간단한 분석 및 모델링
 
- - 여기서는 `h2o` 패키지를 이용하여 __Credit Card Fraud Detection__ 을 위한 모델을 생성해보도록 하겠습니다.
- - `h2o`패키지 설치관련 문서는 h2o_basic_usage_v2.html을 살펴보시기 바랍니다.
+## Introduction
+
+ - 본 문서에서는 Credit Card Fraud Detection 을 위한 모델을 생성해보도록 하겠습니다.
+
  - 사용할 데이터는 캐글에 있는 [Credit Card Fraud Detection](https://www.kaggle.com/mlg-ulb/creditcardfraud) 데이터로 각 변수들은 Time, Amount, Class(Target 변수)를 제외하고 이미 PCA라는 방법을 거쳐서 생성된 변수들(V1 ~ V28)이기 때문에 변수의 의미자체보단 분석 및 모델링에 촛점을 맞추어서 진행하도록하겠습니다.
- - 그리고 기본 사용법 관련문서와 겹치는 부분이 있으나 여기서는 다른 기능들도 같이 살펴보겠습니다.
+
+ - 시나리오는 아래와 같습니다.
+    - 신용카드 사기 탐지 모형을 만드는 것이 목적입니다.
+    - Target(Class)의 Good, Bad 비율을 살펴보고 imbalancing 하다면, 아래 2가지 방식으로 접근하려 합니다.
+        - 1. Under Sampling 후 Classifier 생성 : Good의 비율이 압도적으로 많으면 모델링 시 Good으로만 맞추려는 경향이 생기기 때문에 Good과 Bad의 비율을 어느정도 맞춰주는 작업을 수행합니다.
+        - 2. AutoEncoder를 이용한 Anomaly Detection 수행 : Bad 자체를 하나의 이상치로 간주하여 전체 데이터중 이상치를 검출하기위한 작업을 수행합니다.
+    - Classifier 생성하기 위해서 각 Features(V1 ~ V28, Amount)와 Target(Class)간 분포를 density plot을 통해 어떤 feature가 Target에 영향을 주는지 간단하게 살펴보려 합니다.
+    - Classifier는 정확도가 높게 나올 수 있는 Gradient Boosting Machine을 간단한 모델 하나 만들고 Grid Search를 통한 Hyper parameter 최적화를 하겠습니다.
 
 <br>
 
-## 데이터 탐색해보기
+## 데이터 간단하게 살펴보기
 
  - 모델링을 하기 앞서 기본적으로 데이터를 살펴보는 것은 중요한 작업들중 하나입니다.
- - 여기서는 깊게 보지않고 간단하게만 살펴보도록 하겠습니다.
+ - 여기서는 간단하게 데이터의 일부분 및 Target의 비율을 살펴보도록 하겠습니다.
 
 ### 패키지 및 데이터 불러오기
 
@@ -45,62 +53,271 @@ datatable(
   )
 ```
 
+### 중복 확인 및 제거
+
+ - 데이터중 중복건수가 존재하는지 확인 후 있으면 제거를 하도록 하겠습니다.
+ 
+```{r}
+creditcard_rm_dup <- creditcard_dt[!duplicated(creditcard_dt[, -"Time"]),]
+dim(creditcard_rm_dup)
+```
+
+ - 데이터가 284,807개에서 275,663개로 약 9천개가 줄었습니다.
+ - 이렇게 중복된 건수가 있는지 반드시 확인을 하신 후 제거를 해주셔야합니다.
+ - 확인하지않고 그대로 사용하면 Trainig과 Test set으로 데이터를 나눌때 중복되는 데이터가 각각의 set에 나누어져 들어갈수 있습니다.
+ - 그렇게 되면 제대로된 모형 검증을 수행할 수 없기 때문입니다.
+
 ### Target Level 분포
  - 0 : __Good__, 1 : __Bad__ 를 의미합니다.
  - 이들의 비율이 어떤지 확인해보도록 하겠습니다.
 
 ```{r}
-creditcard_dt$Class %>% 
+creditcard_rm_dup$Class %>% 
   as.vector() %>% 
   table(dnn = "Class") %>% 
   as.data.frame(.) %>% 
   ggplot(data = ., aes(x = as.factor(Class), y = Freq)) + 
   geom_bar(stat = "identity") + 
-  geom_text(aes(label = paste0(round(Freq/sum(Freq), 8) * 100, "%"))) + 
+  geom_text(aes(label = paste0(round(Freq/sum(Freq), 8) * 100, "%"), y = max(Freq) / 2)) + 
   xlab("Target : Class") + ylab("Frequency")
 ```
 
  - Class 1의 비율이 0.17%으로 매우 낮은 수치입니다.
- - 이러한 데이터를 imbalanced data라고 합니다.
- - 이런 경우 보통 Over/Under Sampling을 수행 후 Classifier를 만들거나 Anomaly detection을 통해 Bad 케이스를 검출합니다.
- - 하지만 본 문서에서는 Over/Under Sampling 혹은 Anomaly detection을 수행하지 않고 Classifier를 그냥 만들어보도록 하겠습니다.
+ - imbalanced data이므로 2가지 접근방식을 수행해보도록 하겠습니다.
+    - Under Sampling
+    - Anomaly Detection
 
-### V1 ~ V28 분포
+<br>
+
+## Under Sampling 및 데이터 탐색
+
+### Under Sampling
+
+ - 먼저 Under Sampling을 수행하기에 앞서 개발데이터(training set)와 검증데이터(test set)를 나눈 후 개발데이터에서 Under Sampling을 수행하겠습니다.
+
+> 개발데이터와 검증데이터로 나누기
+
+```{r}
+set.seed(1234)
+train_idx <- sample(nrow(creditcard_rm_dup), size = 0.8 * nrow(creditcard_rm_dup), replace = FALSE)
+cc_train <- creditcard_dt[train_idx,]
+cc_test <- creditcard_dt[-train_idx,]
+```
+
+> 개발데이터에서 Target 분포 수치로 확인
+
+```{r}
+good_count <- sum(cc_train$Class == 0)
+bad_count <- sum(cc_train$Class == 1)
+
+sprintf(
+  "Good 케이스 : %d (%.4f) | Bad 케이스 : %d (%.4f)",
+  good_count,
+  good_count / nrow(cc_train) * 100,
+  bad_count,
+  bad_count / nrow(cc_train) * 100
+  )
+```
+
+> Under Sampling 수행
+
+ - 여기서는 Good과 Bad의 비율을 98:2로 맞췄습니다.
+
+```{r}
+good_idx <- sample(which(cc_train$Class == 0), size = bad_count * 49, replace = FALSE)
+
+cc_train_uns <- cc_train[c(good_idx, which(cc_train$Class == 1)),]
+dim(cc_train_uns)
+```
+
+ - Under Sampling 후 220137 ==> 19650 으로 모델링에 사용할 데이터 셋이 줄어들었습니다.
+
+### 데이터 탐색
+
+> V1 ~ V28 분포
 
  - V1부터 V28까지 각 변수별로 Class에 대해 어떻게 분포되어있는지 density plot으로 살펴보겠습니다.
 
 ```{r fig.width=12, fig.height=12, fig.align='center'}
-creditcard_g <- gather(creditcard_dt, key = "PCA_key", value = "value", -Time, -Amount, -Class)
-ggplot(creditcard_g, aes(x = value)) + geom_density(aes(colour = Class)) + 
+creditcard_g <- gather(cc_train_uns, key = "PCA_key", value = "value", -Time, -Amount, -Class)
+creditcard_g <- as.data.table(creditcard_g)
+ggplot(creditcard_g, aes(x = value)) + geom_density(aes(fill = Class), alpha = 0.3) + 
   facet_wrap(~ PCA_key, nrow = 4, scales = "free")
 ```
 
- - Class에 영향을 주는지 여부를 그래프로 살펴본다면, 아래와 같이 간단하게 예상 할 수 있습니다.
-    + V5, V6, V8, V15, V20, V22, V23, V25, V26, V27, V28 은 영향을 안 줄 것이다.
-    + 그외에는 Class에 어느정도 영향을 줄것이다.
+ - 각 변수별로 Target값에 대한 그래프를 그려봤습니다.
+ - x축과 y축의 값은 잠깐 제외하고 그래프를 살펴보면 비슷한 모양의 그래프를 가진 변수들을 휴리스틱하게 묶을 수 있을 것 같습니다.
+ - 1차적으로는 뾰족하면서 퍼짐정도가 작은 변수들끼리 묶을수 있겠네요.
+    - V5, V6, V7, V8, V20, V21, V23, V27, V28
+ - 2차적으로는 Good, Bad간 그래프가 거의 겹쳐있는 변수들끼리 묶을 수 있겠네요.
+    - V13, V15, V22, V24, V25, V26
+ - 그리고 나머지 변수들을 전부 묶어서 그래프를 보도록 하겠습니다.
+    - V1, V2, V3, V4, V9, V10, V11, V12, V14, V16, V17, V18, V19
+    
+```{r fig.width=12, fig.height=12, fig.align='center'}
+set_1 <- c("V5", "V6", "V7", "V8", "V20", "V21", "V23", "V27", "V28")
 
-### Amount 분포
+creditcard_g[, c("per1", "per99") := list(quantile(value, 0.01), 
+                           quantile(value, 0.99)), by = "PCA_key"]
 
-```{r}
-creditcard_dt %>% 
-  ggplot(aes(x = Amount)) + 
-  geom_density(aes(colour = Class)) + 
-  xlim(c(0, quantile(creditcard_dt$Amount, 0.99)))
+creditcard_g[PCA_key %in% set_1,] %>% 
+  ggplot(., aes(x = value)) + geom_density(aes(fill = Class), alpha = 0.3) +
+  geom_vline(aes(xintercept = per1), linetype = "longdash") +
+  geom_vline(aes(xintercept = per99), linetype = "longdash") + 
+  facet_wrap(~ PCA_key, nrow = 4, scales = "free") + xlim(c(-10, 10))
 ```
 
- - Amount도 Class에 그다지 큰 영향을 주진 않을 것 같다고 예상할 수 있습니다.
+ - 1차적으로 나눈 변수들을 다시 그래프로 표현했습니다.
+    - 하지만 기존에 그렸던 그래프들은 Outlier로 인해 형태를 알아보기 어려웠습니다.
+    - 그래서 1%분위수와 99%분위수를 선으로 표현한 후 x축의 범위를 일괄적으로 -10에서 10까지 지정하여 다시 표현했습니다.
+    - x축의 범위를 줄인 이유는 각 변수별로 데이터가 어떻게 분포되어있는지 자세히 보기위함이었습니다.
+ - 대부분의 변수들은 Good(=0)과 Bad(=1)간 그래프가 많이 겹쳐있는 모습을 볼 수 있습니다.
+ - V6와 V7은 겹치긴했어도 구간화를 수행하면 조금 나아지지않을까하는 생각이 드네요.
+    - 하지만 따로 구간화를 수행하진 않겠습니다.
 
-<br>
+```{r fig.width=12, fig.height=12, fig.align='center'}
+set_2 <- c("V13", "V15", "V22", "V24", "V25", "V26")
 
-## 모델 생성하기
+creditcard_g %>% 
+  filter(PCA_key %in% set_2) %>% 
+  ggplot(., aes(x = value)) + geom_density(aes(fill = Class), alpha = 0.3) +
+  geom_vline(aes(xintercept = per1), linetype = "longdash") +
+  geom_vline(aes(xintercept = per99), linetype = "longdash") + 
+  facet_wrap(~ PCA_key, nrow = 4, scales = "free") + xlim(c(-10, 10))
+```
 
- - `h2o` 패키지를 이용하여 모델링을 수행하겠습니다.
- - 모델링을 수행하기 위해선 아래와 같은 과정을 거쳐야합니다.
-    + R과 h2o 연결
-    + 데이터를 h2o에 올리기
-    + 원하는 모델 생성하기
+ - 2차적으로 나눈 변수들도 1차와 같은 방식으로 그래프를 다시 그렸습니다.
+ - 대부분의 변수들은 Good(=0)과 Bad(=1)간 그래프가 많이 겹쳐있는 모습을 볼 수 있습니다.
+ - 이러한 변수들은 머신러닝 모형에서 그리 중요한 인자로 추출되진 않을 것 같습니다.
 
-### R과 h2o 연결
+```{r fig.width=12, fig.height=12, fig.align='center'}
+set_3 <- c("V1", "V2", "V3", "V4", "V9", "V10", "V11", "V12", "V14", "V16", "V17", "V18", "V19")
+
+creditcard_g %>% 
+  filter(PCA_key %in% set_3) %>% 
+  ggplot(., aes(x = value)) + geom_density(aes(fill = Class), alpha = 0.3) +
+  geom_vline(aes(xintercept = per1), linetype = "longdash") +
+  geom_vline(aes(xintercept = per99), linetype = "longdash") + 
+  facet_wrap(~ PCA_key, nrow = 4, scales = "free") + xlim(c(-10, 10))
+```
+
+ - 나머지 변수들도 1차, 2차와 같은 방식으로 그래프를 다시 그렸습니다.
+ - V19를 제외한 변수들은 Good(=0)과 Bad(=1)를 잘 나누는 것처럼 보이기합니다.
+ - V19는 머신러닝 모형에서 그다지 중요하지 않은 인자로 추출될 것 같아보입니다.
+ - V9은 1차의 V6와 V7과 마찬가지로 구간화를 하면 Target을 잘 분류하는 인자로 바꿀수 있을 것 같지만 구간화를 수행하진 않겠습니다.
+
+> Amount 분포
+
+```{r}
+cc_train_uns[, summary(Amount)]
+```
+
+ - Amount를 시각화 하기전에 `summary`함수를 이용하여 통계량을 추출했습니다.
+
+ - 최솟값은 0이고 중앙값(Median)과 평균값(Mean)은 각각 21.95와 86.385, 최댓값은 6900.47로 Amount값의 스케일 차이가 큽니다.
+
+ - 즉, 최솟값과 최댓값간 차이가 크다고 볼 수 있으며 이런 경우 스케일의 차이를 줄여주는 변환을 수행해야할 수도 있습니다.
+
+ - 그래프를 그려서 확인해보도록 하겠습니다.
+
+```{r}
+cc_train_uns %>% 
+  ggplot(aes(x = Amount)) + 
+  geom_density(aes(fill = Class, colour = Class), alpha = 0.3) + 
+  geom_vline(xintercept = quantile(cc_train_uns$Amount, 0.99))
+```
+
+ - Amount의 경우 꼬리를 기준으로 오른쪽으로 치우쳐져 있습니다.
+
+ - 검정색 선은 Amount의 99퍼센트 분위수 입니다.
+
+ - 그런데 위와 같이 오른쪽으로 꼬리가 긴 분포의 경우 살펴보기가 너무 힘듭니다.
+
+ - 먼저 검정색 선까지만 density plot을 그려보겠습니다.
+
+```{r}
+cc_train_uns %>% 
+  ggplot(aes(x = Amount)) + 
+  geom_density(aes(fill = Class, colour = Class), alpha = 0.3) + 
+  xlim(c(quantile(cc_train_uns$Amount, c(0, 0.99))))
+```
+
+ - 그래프를 봤을 때, Class가 0일 때 분포와 1일 때 분포가 그리 많이 차이나지 않는 것 같습니다.
+
+ - 대체로 두 집단간 차이가 없어보이지만 이 그림 하나로는 설명이 부족합니다.
+
+ - 그래서 Boxplot을 하나 더 시각화해서 Class간 Amount 분포 차이가 있는지 살펴보겠습니다.
+
+```{r}
+cc_train_uns %>% 
+  ggplot(aes(x = Class, y = Amount)) + 
+  geom_boxplot(aes(fill = Class), alpha = 0.3) + 
+  ylim(c(quantile(cc_train_uns$Amount, c(0, 0.99))))
+```
+
+ - 위처럼 Boxplot이 그려지는 이유는 Outlier에 해당하는 데이터가 많기 때문입니다.
+
+ - 그래서 여전히 분포간 차이가 있는지 보기가 쉽지않습니다.
+
+ - 때문에 log변환을 수행 후 다시 시각화를 하였습니다.
+
+ - 단, Amount의 최솟값중 0이 포함되어있기 때문에 1을 더한 후 log변환을 수행했습니다.
+
+```{r}
+cc_train_uns %>% 
+  ggplot(aes(x = log(Amount + 1))) + 
+  geom_density(aes(fill = Class), alpha = 0.3) +
+  xlab("log (Amount + 1)")
+```
+
+ - x축에서 대략 1.5 ~ 2.5사이 값에서 5.0 값사이에는 Class가 0인 데이터가 더 많다는 걸 볼 수 있습니다.
+
+```{r}
+mean_fun <- function(x) data.frame(y = mean(x), label = paste0("mean = ", round(mean(x), 4)))
+
+cc_train_uns %>% 
+  ggplot(aes(x = Class, y = log(Amount + 1))) + 
+  geom_boxplot(aes(fill = Class), alpha = 0.3) +
+  stat_summary(fun.y = mean, geom = "point", colour = "darkred", size = 3) +
+  stat_summary(fun.data = mean_fun, geom = "text", vjust = -1.2) +
+  ylab("log (Amount + 1)")
+```
+
+
+ - 각 Class 별 Box를 보면 중간에 검정색 실선이 하나 그려져 있는데 이는 중앙값이라고 해서 50퍼센트 분위수를 가리킵니다.
+
+ - Box의 테두리중 수평선 2개가 있는데 각각 25퍼센트 분위수와 75퍼센트 분위수를 가리킵니다.
+
+ - 그리고 평균값은 어두운 빨간색점과 텍스트로 표시하였습니다.
+
+ - Box의 크기는 Class가 0일때보다 1일때 더 크며, 평균값과 중앙값은 둘다 Class가 1일때가 0일때보다 더 작습니다.
+
+ - Class가 0일때 사분위수 범위가 1일때 사분위수 범위에 포함되며 density plot과 함께 살펴보면 log(Amount + 1)이 Class에
+ 어느정도 영향을 줄 거라고 예상할 수 있습니다.
+
+ - 나중에 모델링을 수행하면서 Amount를 넣었을 때 모형과 log(Amount + 1)를 넣었을때 모형중 어느것이 더 좋은지 확인해보도록 하겠습니다.
+
+```{r}
+cc_train[, log_amount_1 := log(Amount + 1)]
+cc_train_uns[, log_amount_1 := log(Amount + 1)]
+cc_test[, log_amount_1 := log(Amount + 1)]
+```
+
+
+### 탐색 후 summary
+
+ - V1 ~ V28, 그리고 Amount의 분포를 살펴봤습니다.
+ - Target에 영향을 줄 것 같지 않을 변수들을 살펴보고, 그 중 3가지의 변수는 구간화를 통해 더 나은 인자가 될 것 같습니다.
+    - V6, V7 그리고 V9
+ - 그런데 구간화를 수행하지 않겠다고 이야기 했습니다.
+ - 그 이유는 저희가 이번에 사용할 모형은 RandomForest와 Gradient Boosting Machine인데 이미 Tree-Based 모형이라서 내부적으로 알아서 구간화를 수행하기 때문입니다.
+ - 그리고 Amount의 경우 log(Amount + 1)를 수행하여 Amount를 넣었을 때와 log(Amount + 1)를 넣었을때 모형에서 변수중요도가 어떻게 추출되는지 확인해볼 것 입니다.
+
+### Classifier 생성
+
+ - `h2o` 패키지를 이용하여 Gradient Boosting Machine(GBM) 모델을 하나 생성해보도록 하겠습니다.
+
+> R과 h2o 연결
 
 ```{r}
 h2o.init(nthreads = -1)
@@ -113,159 +330,84 @@ h2o.no_progress()
 ```
 
 
-### 데이터를 h2o에 올리기
-
- - "데이터를 h2o에 올린다"는 말이 잘 이해가 안될 수 있습니다.
- - 이는 h2o는 Java Virtual Machine(이하 JVM)상에서 실행되기 때문에 데이터도 JVM상에 올려야한다는 이야기 입니다.
- - 쉽게 말해 작업하고자하는 공간에 재료를 밀어넣는 과정이라고 보시면 됩니다.
- - h2o에 데이터를 올리는 방법은 크게 2가지 입니다.
-    + 파일에서 직접 데이터를 올린다.
-    + R의 데이터 프레임을 h2o의 오브젝트로 변환한다.
-
-> 파일에서 직접 데이터 가져오기 
+> 모델 생성시 필요한 feature와 target 지정
 
 ```{r}
-import_file_cc <- h2o.importFile("creditcard.csv", destination_frame = "import_file_cc")
+target <- "Class"
+features <- names(cc_train_uns)[! names(cc_train_uns) %in% c(target, "Time")]
 ```
  
- - 위와 같이 파일에 있는 데이터를 바로 h2o에 올릴 수 있습니다.
- - 사용할 함수는 `h2o.importFile`입니다.
- - 물론 HDFS에서도 바로 가져올수 있으며, 다른 DB에서도 가져올수 있는 함수도 제공합니다.
- - 보통은 데이터의 용량이 너무 큰 경우 위와 같이 데이터를 직접 불러옵니다.
- - 원래 가지는 파일의 용량보다 메모리를 적게 차지하도록 압축하여 h2o상에 올립니다.
-
-> R의 데이터 프레임을 h2o 오브젝트로 변환
+> h2o 엔진활용을 위한 오브젝트 변환
 
 ```{r}
-as_h2o_cc <- as.h2o(creditcard_dt, destination_frame = "as_h2o_cc")
+cc_train_uns_h2o <- as.h2o(cc_train_uns, destination_frame = "cc_train_uns_h2o")
+cc_test_h2o <- as.h2o(cc_test, destination_frame = "cc_test_h2o")
 ```
 
- - 또는 R상에서 작업중인 데이터를 h2o로 올릴 수 있습니다.
- - `as.h2o`를 이용하면 쉽게 올릴 수 있습니다.
- - 그리고 자세히 보시면 `destination_frame`이라는 argument가 있는데 이는 h2o가 내부적으로 가리키는 Key입니다.
- - 즉, h2o에서 원하는 오브젝트에 접근하기 위해서는 그 오브젝트의 Key를 알아야합니다.
- - 한번 `as_h2o_cc`오브젝트에 접근해보도록 하겠습니다.
+> GBM 모델 생성
 
 ```{r}
-head(as_h2o_cc)
+model <-
+    h2o.gbm(
+    x = features,
+    y = target,
+    training_frame = cc_train_uns_h2o,
+    model_id = "simple_gbm",
+    nfolds = 5,
+    keep_cross_validation_predictions = TRUE,
+    fold_assignment = "Modulo"
+    )
 ```
 
- - 위와 같이 R에서도 접근 가능하도록 오브젝트로 만들어서 접근가능하지만,
-
-```{r}
-head(h2o.getFrame("as_h2o_cc"))
-```
-
- - 이렇게 Key 로도 접근이 가능합니다.
- - 저는 주로 Key와 R오브젝트 이름을 동일하게 하여 작업을 수행합니다.
- - 그래야 헷갈리지 않기 때문입니다.
- - Key를 지정하지 않으면 h2o에서 알아서 Key를 지정해버립니다.
-
-### 원하는 모델 생성하기
+ - 간단한 GBM 모델을 만들었습니다.
+ - Gradient Boosting Machine에서 Boosting이란 앙상블 기법의 일종이며, weak learner들의 앙상블모형이라 보시면 되겠습니다.
+    - 쉽게 말씀드리자면, base learner가 training set을 이용하여 학습 후 처음 base learner의 예측값과 실제값사이의 residuals를 구합니다.
+    - 이 residuals을 Target으로, 기존 base learner를 학습시킬때 사용했던 features들을 이용하여 weak learner를 학습시킵니다.
+    - 새로운 base learner는 기존 base learner + weak learner 입니다.
+    - 이러한 과정을 반복적으로 수행합니다.
+    - 그러면 결국 생성되는 base learner는 맨처음 만든 base learner + 여러개의 weak learner들이 됩니다.
+    
+ - weak learner는 Tree 모형이 될 수 있고 선형 모형이 될 수도 있습니다.
  
- - 드디어 모델을 생성하는 단계까지 왔습니다.
- - 시험삼아서 Random Forest 모델을 만들어볼까요?
- - 그 전에 feature와 target을 지정해보겠습니다.
+ - Boosting도 여러가지 알고리즘들이 존재하며, 저는 그 중 Gradient Boosting Machine을 사용했습니다.
+ 
+  - 기본적으로 `h2o`에서는 weak learner가 Tree 모형이며, GBM말고도 Xgboost도 존재합니다.
+  
+ - LightGBM은 따로 구현되어있진 않고 Xgboost를 사용할 때 options을 바꾸면 LightGBM을 모방할 수 있습니다.
+ 
+ - Boosting에 대해서 자세히 알고 싶다면 [Boosting](https://en.wikipedia.org/wiki/Boosting_(machine_learning))을 살펴보세요.
+    
+> GBM 모델 결과 확인
+
+ - 위에서 수행했던 GBM의 Hyper parameter 셋팅은 아래처럼 확인을 하실 수 있습니다.
+ - 그리고 5-folds cross-validation을 수행하였습니다.
+
+```{r}
+summary(model)
+```
+
+> Test set으로 성능 측정
+
+```{r}
+h2o.performance(model, newdata = cc_test_h2o)
+```
+
+```{r}
+sprintf("검증데이터 셋의 AUC : %.5f", h2o.auc(h2o.performance(model, newdata = cc_test_h2o)))
+```
+
+> Grid Search를 통한 최적의 Hyperparameter set 찾아보기
+
+ - 하지만 이 모델이 최적화된 모델은 아니겠죠?
+ - 성능개선을 위해 Grid Search를 통해 나름대로 GBM의 최적의 Hyper parameter set을 찾아보도록 하겠습니다.
  
 ```{r}
-all_v <- names(as_h2o_cc) # 모든 변수 리스트
-target <- "Class" # Target
-except_v <- "Time" # 제외할 변수
-features <- all_v[!all_v %in% c(target, except_v)] # Target과 제외할 변수를 뺀 나머지 변수들은 feature로 지정
-```
+grid_id <- "gbm_grid"
 
- - 한 가지 더! 데이터셋을 train set과 test set으로 나누어보도록 하겠습니다.
- 
-```{r}
-split_h2o <-
-  h2o.splitFrame(
-  as_h2o_cc,
-  ratios = 0.7,
-  destination_frames = c("train_h2o", "test_h2o"),
-  seed = 1234
-  )
-```
-
- - Train set
-```{r}
-dim(h2o.getFrame("train_h2o"))
-```
-
- - Test set
-```{r}
-dim(h2o.getFrame("test_h2o"))
-```
-
-> h2o.randomForest를 이용한 모델링
-
-```{r}
-simple_rf <-
-  h2o.randomForest(
-  x = features,
-  y = target,
-  training_frame = h2o.getFrame("train_h2o"),
-  model_id = "simple_rf"
-  )
-```
-
-```{r}
-summary(simple_rf)
-```
-
- - 축하합니다! h2o를 이용해서 Random Forest 모델을 하나 생성했습니다.
- - 모델의 정보는 R의 `summary`함수를 이용하면 하이퍼 파라미터의 정보부터 train set에 대한 성능 그리고 변수 중요도까지 확인 할 수 있습니다.
- - 그런데 train set의 성능은 당연히 좋을 수 밖에 없겠죠?
- - 그래서 한가지 옵션을 더 줘서 Cross-Validation이라는 걸 수행해보도록 하겠습니다.
-
-> Cross-Validation을 통한 Random Forest 모델링 및 검증
-
-```{r}
-cv_rf <-
-  h2o.randomForest(
-  x = features,
-  y = target,
-  training_frame = h2o.getFrame("train_h2o"),
-  model_id = "cv_rf",
-  nfolds = 5,
-  keep_cross_validation_predictions = TRUE,
-  fold_assignment = "Modulo"
-  )
-```
-
- - Cross-Validation은 우리말로 교차 검증이라는 의미를 가집니다.
- - 즉, train set을 또 다른 train set과 validation set으로 나누어서 validation set의 성능을 살펴보는데 이를 여러번 수행하는 것입니다.
- - 대표적인 방법으로 n-fold cross-validation이 있습니다.
-    + 이는 train set을 n개의 set으로 나눈 뒤에
-    + n - 1 개는 모델링에, 나머지 1개는 검증에 쓰입니다.
-    + 이러한 과정을 n번 수행하기 때문에 h2o에서는 그만큼의 모델을 생성합니다.
-    + n이 5일때는 아래 이미지를 보시면 되겠습니다.
-
-![](img/nfolds_cv.png)
-
-```{r}
-summary(cv_rf)
-```
-
- - Cross-Validation을 수행하고나니 해당 성능까지 추가되서 reporting이 되는 걸 볼 수 있습니다.
- - 그럼 test set의 성능은 어떨까요?
-
-> h2o.performance를 이용한 해당 데이터셋에 대한 모델의 성능
-
-```{r}
-h2o.performance(cv_rf, newdata = h2o.getFrame("test_h2o"))
-```
-
- - test AUC : 0.9508529(실행할때마다 달라질수 있음) 입니다. 그렇게 나쁜 성능은 아니네요.
- - 혹시 더 개선시킬 수 있을까요?
-    + 반드시 개선되리라는 법은 없지만 그럴 가능성이 있는 방법이 있습니다.
-    + 더 적절한 하이퍼파라미터를 찾는 것인데 그걸 가능하게 하는 함수가 바로 `h2o.grid` 입니다.
-    + 즉 하이퍼라미터의 조합대로 모델링을 수행하고 그중 원하는 기준하에서 가장 좋은 모델을 찾을수 있습니다.
-
-```{r}
 hyper_params <- list(
-  ntrees = c(50, 150, 300),
-  max_depth = c(18, 20, 22),
-  mtries = as.integer(seq(3, length(features), length.out = 4))
+  ntrees = c(50, 100, 150, 200, 300),
+  max_depth = c(4, 5, 6, 7),
+  col_sample_rate = c(1, 0.8, 0.6)
 )
 
 search_criteria <- list(
@@ -273,21 +415,18 @@ search_criteria <- list(
 )
 ```
 
- - hyper_params : 실험하고자하는 하이퍼 파라미터 셋팅을 list로 만듭니다.
-    + 주의점은 grid search가 가능한 파라미터가 있고 그렇지 않은 것이 있으며, 너무 많은 조합은 계산시간이 오래걸리게 합니다.
- - search_criteria : 실험 옵션을 설정하는 거라고 보시면 됩니다.
-    + 너무 조합이 많은데 여러가지 해보고 싶다면 search_criteria를 설정시 strategy를 "RandomDiscrete"로 하고, max_models를 설정하시면 됩니다.
-    + 그런거 상관없이 모든 조합에 대해서 하고싶다면 strategy를 "Cartesian"으로 설정하시면 됩니다.
+ - 실험하고자하는 Hyperparameter 값들을 위와 같이 셋팅합니다.
 
+ - 시간이 조금 오래 걸려서 최대 만드는 모델은 5개로 제한하였습니다.
 
 ```{r}
-rf_grid <-
+gbm_grid <-
   h2o.grid(
   x = features,
   y = target,
-  algorithm = "randomForest",
-  training_frame = h2o.getFrame("train_h2o"),
-  grid_id = "rf_grid",
+  algorithm = "gbm",
+  training_frame = cc_train_uns_h2o,
+  grid_id = grid_id,
   hyper_params = hyper_params,
   search_criteria = search_criteria,
   nfolds = 5,
@@ -296,99 +435,354 @@ rf_grid <-
   )
 ```
 
-```{r}
-summary(rf_grid)
-```
-
- - 이렇게 각 조합별 모델의 성능 등을 확인 할 수 있습니다.
- - AUC를 기준으로 가장 좋은 모델을 가져오도록 하겠습니다.
+ - AUC를 기준으로 정렬 후 비교적 AUC가 높은 모델을 뽑았습니다.
 
 ```{r}
-rf_grid_by_auc <- h2o.getGrid("rf_grid", sort_by = "auc", decreasing = TRUE)
-summary(rf_grid_by_auc)
+gbm_grid_auc <- h2o.getGrid(grid_id, sort_by = "auc", decreasing = TRUE)
+summary(gbm_grid_auc)
 ```
-
- - AUC 기준으로 Grid내 모델을 내림차순으로 정렬
 
 ```{r}
-best_rf <- h2o.getModel(rf_grid_by_auc@model_ids[[1]])
-summary(best_rf)
+gbm_best <- h2o.getModel(gbm_grid_auc@model_ids[[1]])
+sprintf("검증데이터 셋의 AUC : %.5f", h2o.auc(h2o.performance(gbm_best, newdata = cc_test_h2o)))
 ```
 
- -  AUC 기준 비교적 좋은 모델 불러오기
+> 변수 중요도 확인
+
+```{r}
+varimp_dt <- as.data.table(h2o.varimp(gbm_best))
+varimp_dt[, rank := 1:nrow(varimp_dt)]
+varimp_dt[, c("rank", "variable"), with = FALSE]
+```
+
+ - 변수 중요도를 한번 살펴보도록 하겠습니다.
+ - 탐색 당시 몇몇 변수들은 중요도에서도 상위랭크를 차지하지 못할 거라고 이야기 했었는데 그러한 경우도 있고 아닌 경우도 있네요.
+ - 특히, V26은 정말 의외의 결과였습니다.
+ - 그래프를 봤을땐 Good과 Bad를 잘 나누지 못했는데 중요한 변수들중 Top 10에 드는군요.
+ - 그리고 log(Amount + 1)이 Amount에 비해서 더 중요한 변수로 인식됐습니다.
+
+> 모델저장
+
+ - 가장 좋은 모델을 선별했다고 가정하고 이 모델을 저장해봅시다.
+
+```{r}
+h2o.saveModel(gbm_best, "gbm_best", force=TRUE)
+```
+
+ - 이렇게 모델을 저장해두면 h2o의 버전이 다르지 않는 이상 다른 PC에서도 해당 모델을 사용하실 수 있습니다. 
+
+<br>
+
+## Anomaly Detection
+ 
+ - 이번에는 Deep Learning 모델중 AutoEncoder를 이용해서 Anomaly Detection을 수행해봅시다.
+ - Bad 케이스가 상당히 적은 상황에서 Bad를 하나의 이상치로 보고 이상치를 검출하는 작업을 하는 것입니다.
+ - 그러기 위해서 먼저 AutoEncoder모델을 만들어야 합니다.
+ - tensorflow나 Keras도 있지만, 저는 이번에도 h2o를 이용하였습니다.
+ - 이상치 검출 모델을 만든다는 의미는 Good에 해당하는 데이터를 만드는 모형을 하나 만들고, 그 모형에 Good, Bad 케이스를 넣으면, Good의 경우에는 원래 데이터에 가깝게 잘 만들어내지만, Bad의 경우 원래 데이터와 동떨어지게 만들어집니다.
+ - 그렇게 만들어진 데이터와 원래 데이터간의 Mean Square Error를 계산하면 Good에 비해서 Bad의 경우가 Error가 커지게됩니다.
+ - 이때 Error에 threshold를 지정해서 Good과 Bad를 나눌 수 있습니다.
+ - 다행히도 현재 가지고 있는 데이터가 전부 연속형 변수들이기 때문에 이 방법을 사용할 수 있습니다.
+ - 그리고 위에서 얻은 Classifier의 variable importance를 이용해서 중요한 변수 Top10에 대해서도 Anomaly Detection을 수행해보도록 하겠습니다.
+
+### AutoEncoder 모델 생성
+
+ - 먼저 Good에 해당하는 데이터를 선별 후 모델을 생성하겠습니다.
+
+> Good에 해당하는 데이터 선택
+
+```{r}
+cc_train_good_h2o <- as.h2o(cc_train[Class == 0,], destination_frame = "cc_train_good_h2o")
+```
+
+> Autoencoder를 위한 모델 생성
+
+```{r}
+autoencoder <-
+  h2o.deeplearning(
+  x = features,
+  training_frame = cc_train_good_h2o,
+  model_id = "autoencoder",
+  activation = "Tanh",
+  hidden = c(15, 15),
+  epochs = 50,
+  autoencoder = TRUE
+  )
+```
+
+> anomaly detection을 위한 reconstruction error 생성
+
+```{r}
+cc_anon <- h2o.anomaly(autoencoder, data = cc_test_h2o)
+head(cc_anon)
+```
+
+> reconstruction error에 Target값 맵핑 및 시각화
+
+```{r}
+reconstruct_dt <- cbind(as.data.table(cc_anon), Class = as.factor(as.vector(cc_test_h2o$Class)))
+head(reconstruct_dt)
+```
+
+```{r}
+ggplot(reconstruct_dt, aes(x = 1:nrow(reconstruct_dt), y = Reconstruction.MSE)) +
+  geom_point(aes(colour = Class), alpha = 0.5)
+```
+
+```{r}
+reconstruct_dt[, c("pred_25", "pred_50", "pred_Mean", "pred_75", "pred_85", "pred_95", "pred_99", "pred_99.5") := list(
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.25), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > median(Reconstruction.MSE), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > mean(Reconstruction.MSE), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.75), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.85), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.95), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.99), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.995), 1, 0))
+)]
+
+reconstruct_dt[, table(Class, pred_25)]
+reconstruct_dt[, table(Class, pred_50)]
+reconstruct_dt[, table(Class, pred_Mean)]
+reconstruct_dt[, table(Class, pred_75)]
+reconstruct_dt[, table(Class, pred_85)]
+reconstruct_dt[, table(Class, pred_95)]
+reconstruct_dt[, table(Class, pred_99)]
+reconstruct_dt[, table(Class, pred_99.5)]
+```
+
+ - threshold를 Error의 분위수 및 평균값으로 바꿔가면서 Confusion Matrix를 그려봤지만 GBM의 Classifier보단 성능이 별로 좋지않습니다.
+
+ - 위 그래프에서도 살펴봤을 때 Class가 Bad(== 1)일때보다 Good(== 0)인 경우 Error가 큰 데이터도 있습니다.
+
+ - 이는 AutoEncoder 모델에 의해 생성된 데이터들 중 몇몇 변수를 잘 생성하지 못해서 그럴 수도 있습니다.
+
+
+> Best GBM의 Top 10 변수를 이용한 AutoEncoder
+
+ - 이번에는 위에서 Best GBM model에 의해 선택된 Top 10 변수만 가지고 AutoEncoder를 수행해보겠습니다.
+
+```{r}
+autoencoder_top10 <-
+  h2o.deeplearning(
+  x = varimp_dt[, variable[1:10]],
+  training_frame = cc_train_good_h2o,
+  model_id = "autoencoder_top10",
+  activation = "Tanh",
+  hidden = c(5, 5),
+  epochs = 50,
+  autoencoder = TRUE
+  )
+```
+
+```{r}
+cc_anon <- h2o.anomaly(autoencoder_top10, data = cc_test_h2o)
+```
+
+```{r}
+reconstruct_dt <- cbind(as.data.table(cc_anon), Class = as.factor(as.vector(cc_test_h2o$Class)))
+```
+
+```{r}
+ggplot(reconstruct_dt, aes(x = 1:nrow(reconstruct_dt), y = Reconstruction.MSE)) +
+  geom_point(aes(colour = Class), alpha = 0.5)
+```
+
+```{r}
+reconstruct_dt[, c("pred_25", "pred_50", "pred_Mean", "pred_75", "pred_85", "pred_95", "pred_99", "pred_99.5") := list(
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.25), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > median(Reconstruction.MSE), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > mean(Reconstruction.MSE), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.75), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.85), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.95), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.99), 1, 0)),
+  as.factor(ifelse(Reconstruction.MSE > quantile(Reconstruction.MSE, probs = 0.995), 1, 0))
+)]
+
+reconstruct_dt[, table(Class, pred_25)]
+reconstruct_dt[, table(Class, pred_50)]
+reconstruct_dt[, table(Class, pred_Mean)]
+reconstruct_dt[, table(Class, pred_75)]
+reconstruct_dt[, table(Class, pred_85)]
+reconstruct_dt[, table(Class, pred_95)]
+reconstruct_dt[, table(Class, pred_99)]
+reconstruct_dt[, table(Class, pred_99.5)]
+```
+
+ - 중요한 변수 10개만 가지고 해도 전체 변수로 AutoEncoder 모델의 성능과 크게 차이는 없습니다.
+ 
+ - 다만, Classifier보다 괜찮은 성능을 보이진 않는 것 같습니다
+
+```{r}
+h2o.confusionMatrix(h2o.performance(gbm_best, newdata = cc_test_h2o))
+```
+
+ - 따라서, 2가지 접근 방법중 Under Sampling 후 Classifier를 만드는 것이 비교적 괜찮은 방법이라고 볼 수 있습니다.
+
+ - 이번에는 Classifier를 GBM 뿐만 아니라 Random Forest와 Deep Learning 모델을 더 만들어서 모델 비교를 한번 해보도록 하겠습니다.
+
+## 다양한 모델 생성 및 비교
+
+ - GBM의 모델 특성상 학습중 계산되는 residuals에 가중치를 둬서 학습을 하기 때문에 정확도가 높게 나오는 경우가 있습니다.
+
+ - 그렇다고 항상 RandomForest와 Deep Learning보다 나은 것은 아닙니다.
+
+ - 이번에는 RandomForest와 Deep learning 모델을 만들고 비교해보겠습니다.
+
+ - 또한, 만들어진 모델들을 이용하여 앙상블 모델을 만들어 보도록 하겠습니다.
+
+> Random Forest grid search
+
+ - 기본 Hyperparameter값을 포함해서 Random Forest Grid Search를 해보도록 하겠습니다.
  
 ```{r}
-h2o.performance(best_rf, newdata = h2o.getFrame("test_h2o"))
+grid_id <- "rf_grid"
+
+hyper_params <- list(
+  ntrees = c(50, 100, 150, 200, 300, 400),
+  max_depth = c(16, 18, 20, 22, 24),
+  sample_rate = c(0.8, 0.6320000291, 0.4)
+)
+
+search_criteria <- list(
+  strategy = "RandomDiscrete", max_models = 5
+)
 ```
  
- - 위와 같이 Cross-Validation과 같이 수행하여 여러가지 하이퍼 파라미터 조합중 가장 좋은 set의 모델을 선택할 수 있습니다.
-
- - 그럼 다른 모델들은 그냥 버릴까요?
-    + 그럴수도 있지만 앙상블을 수행할 수도 있습니다.
-    
-> h2o.stackedEnsemble을 이용한 Ensemble 모형 생성하기
 
 ```{r}
-rf_grid_ensemble <- h2o.stackedEnsemble(
+rf_grid <-
+  h2o.grid(
   x = features,
   y = target,
-  training_frame = h2o.getFrame("train_h2o"),
-  model_id = "rf_grid_ensemble",
-  base_models = rf_grid_by_auc@model_ids,
-  metalearner_algorithm = "drf",
+  algorithm = "randomForest",
+  grid_id = grid_id,
+  training_frame = cc_train_uns_h2o, 
+  hyper_params = hyper_params, 
+  search_criteria = search_criteria, 
+  nfolds = 5,
+  keep_cross_validation_predictions = TRUE,
+  fold_assignment = "Modulo"
+  )
+```
+
+```{r}
+rf_grid_auc <- h2o.getGrid(grid_id, sort_by = "auc", decreasing = TRUE)
+summary(rf_grid_auc)
+```
+
+```{r}
+rf_best <- h2o.getModel(rf_grid_auc@model_ids[[1]])
+sprintf("검증데이터 셋의 AUC : %.5f", h2o.auc(h2o.performance(rf_best, newdata = cc_test_h2o)))
+```
+
+
+> Deep Learning grid search
+
+```{r}
+grid_id <- "dl_grid"
+
+hyper_params <- list(
+  hidden = list(c(200, 200), c(80, 80), c(100, 100), c(150, 120)),
+  input_dropout_ratio = c(0, 0.1, 0.2, 0.3),
+  activation = c("Rectifier", "Tanh", "RectifierWithDropout", "TanhWithDropout")
+)
+
+search_criteria <- list(
+  strategy = "RandomDiscrete", max_models = 5
+)
+```
+
+```{r}
+dl_grid <-
+  h2o.grid(
+  x = features,
+  y = target,
+  algorithm = "deeplearning",
+  grid_id = grid_id,
+  training_frame = cc_train_uns_h2o, 
+  hyper_params = hyper_params, 
+  search_criteria = search_criteria, 
+  nfolds = 5,
+  keep_cross_validation_predictions = TRUE,
+  fold_assignment = "Modulo",
+  epochs = 10
+  )
+```
+
+```{r}
+dl_grid_auc <- h2o.getGrid(grid_id, sort_by = "auc", decreasing = TRUE)
+summary(dl_grid_auc)
+```
+
+```{r}
+dl_best <- h2o.getModel(dl_grid_auc@model_ids[[1]])
+sprintf("검증데이터 셋의 AUC : %.5f", h2o.auc(h2o.performance(dl_best, newdata = cc_test_h2o)))
+```
+
+## 앙상블 모델 생성하기
+
+ - 위에서 3가지의 모델중 가장 괜찮은 모델 하나를 선택할 수 있지만 전부 사용해서 앙상블 모델을 생성할 수 있습니다.
+ - 앙상블을 사용하는 이유는 정확도측면도 있지만 하나의 예측값의 분산을 줄이는 효과를 지닙니다.
+ - 앙상블도 여러 종류가 있는데 여기서는 Stacked Ensemble을 사용하려합니다.
+     - 단순히 예측값들의 평균값을 사용하는 방식보단 비교적 정확한 모델에 더 큰 가중치를 두어 예측값의 가중평균값을 이용하는게 좋습니다.
+     - 그러나 얼마만큼의 가중치를 두어야하는지 정하는 것은 쉽지않습니다.
+     - Stacked Ensemble은 각 모델들의 Cross-Validation의 예측값들을 사용하여 각 모델의 가중치를 어떤 값으로 두어야하는지 GLM 등 다른 알고리즘을 사용하여 메타 모델을 만들어냅니다.
+     - 만들어진 메타 모델을 이용하여 개별 모델간 가중치를 계산하여 예측값들의 가중평균값을 얻어냅니다.
+ - 앙상블 모델을 생성하기 위해서는
+     - 1. 각 개별 모델을 생성 할 때 Cross-Valiation의 예측값이 필요합니다.
+     - 2. Cross-Validation 수행시 데이터를 나누는 방법이 같아야합니다.
+ - 직접 구현 할 수도 있지만, 시간이 오래 걸리기 때문에 저는 h2o패키지를 이용하여 앙상블 모델을 만들어보려합니다.
+ - 지금까지 만들어진 Best 모델 3개를 이용해서 앙상블 모델을 만들어봅시다.
+
+> Best3 모델을 이용한 앙상블 모델 생성
+
+```{r}
+stacked_ensemble_best3 <-
+  h2o.stackedEnsemble(
+  x = features,
+  y = target,
+  training_frame = cc_train_uns_h2o,
+  model_id = "stacked_ensemble_best3",
+  base_models = list(gbm_best, rf_best, dl_best),
   metalearner_nfolds = 5,
+  metalearner_fold_assignment = "Modulo",
   seed = 1234
   )
 ```
+
 ```{r}
-summary(rf_grid_ensemble)
+summary(stacked_ensemble_best3)
 ```
 
- - 위와 같이 Stacked 앙상블을 수행할 수 있습니다.
 ```{r}
-h2o.performance(rf_grid_ensemble, newdata = h2o.getFrame("test_h2o"))
+sprintf("검증데이터 셋의 AUC : %.5f", h2o.auc(h2o.performance(stacked_ensemble_best3, newdata = cc_test_h2o)))
 ```
 
 <br>
 
-## 모델 저장하기 및 불러오기
- - 모델링만 수행하는게 아니라 모델을 저장해야하는 경우도 있습니다.
- - `h2o`에서는 `h2o.saveModel`라는 함수를 이용하여 모델을 저장 할 수 있습니다.
- - 그리고 `h2o.loadModel` 함수를 이용하여 모델을 불러올 수 있습니다.
-
-> 데이터 저장
-
-```{r}
-train_h2o <- h2o.getFrame("train_h2o") %>% as.data.table()
-write.csv(train_h2o, "./train_h2o.csv", row.names = FALSE)
-
-test_h2o <- h2o.getFrame("test_h2o") %>% as.data.table()
-write.csv(test_h2o, "./test_h2o.csv", row.names = FALSE)
-```
- 
-
-> 모델 저장하기
-
-```{r}
-h2o.saveModel(object = best_rf, path = "./best_rf", force = TRUE)
-```
-
-> 모델 불러오기
-
-```{r}
-load_rf <- h2o.loadModel(path = paste0("./best_rf/", list.files("./best_rf/")))
-summary(load_rf)
-```
-
 ## Summary
- - 지금까지 제가 RandomForest 모델을 생성하면서 다른 기능들도 같이 살펴봤습니다.
- - `h2o`의 기본적인 사용에 관한 설명은 h2o_basic_usage_v2.html 문서를 봐주시면 감사하겠습니다.
- - 모델 Deploy 예제는 h2o_mojo_example.R을 살펴보시면 되겠습니다.
- - 그리고 여기서 끝내지마시고 RandomForest를 GBM으로 혹은 DeepLearnning으로 바꿔가시면서 한번 수행해보시면 `h2o` 사용하는 것은 어느정도 감이 잡히실 겁니다.
 
-## Reference :
- - http://docs.h2o.ai/h2o/latest-stable/h2o-docs/index.html
- - https://www.kaggle.com/dansbecker/cross-validation
- - https://www.kaggle.com/mlg-ulb/creditcardfraud
+ - 지금까지 작업을 요약해보겠습니다.
+
+ - 데이터는 Credit Card Fraud Detection 데이터로 캐글에 있는 데이터를 사용했고, Time, Amount, Class를 제외한 변수들은 PCA를 거쳐서 나온 변수들입니다.
+
+ - Class가 Target으로 0가 Good(사기 X), 1이 Bad(사기 O) 인데 매우 불균형한 데이터입니다.
+
+ - 그래서 2가지 접근방식을 시도했습니다.
+    - 1. Under Sampling을 이용한 Class 비율 조정 후 Classifier 생성
+    - 2. Anomaly Detection 수행
+
+ - 2가지 접근방식 수행 후 성능을 봤을때 1)가 비교적 좋았습니다.
+
+ - Classifier를 수행시 GBM, RandomForest, DeepLearning 3가지를 수행했으며, 비교적 성능이 좋은 모델이 무엇인지 살펴보고 앙상블 모델을 생성했습니다.
+
+<br>
+<br>
+
+
+
+
 
 
